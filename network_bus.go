@@ -3,10 +3,6 @@ package EventBus
 import (
 	"errors"
 	"fmt"
-	"net"
-	"net/http"
-	"net/rpc"
-	"sync"
 )
 
 // NetworkBus - object capable of subscribing to remote event buses in addition to remote event
@@ -26,7 +22,7 @@ func NewNetworkBus(address, path string) *NetworkBus {
 	bus.sharedBus = New()
 	bus.Server = NewServer(address, path, bus.sharedBus)
 	bus.Client = NewClient(address, path, bus.sharedBus)
-	bus.service = &NetworkBusService{&sync.WaitGroup{}, false}
+	bus.service = &NetworkBusService{}
 	bus.address = address
 	bus.path = path
 	return bus
@@ -39,38 +35,29 @@ func (networkBus *NetworkBus) EventBus() Bus {
 
 // NetworkBusService - object capable of serving the network bus
 type NetworkBusService struct {
-	wg      *sync.WaitGroup
-	started bool
+	rpc rpcHTTP
 }
 
 // Start - helper method to serve a network bus service
 func (networkBus *NetworkBus) Start() error {
-	var err error
 	service := networkBus.service
-	clientService := networkBus.Client.service
-	serverService := networkBus.Server.service
-	if !service.started {
-		server := rpc.NewServer()
-		server.RegisterName("ServerService", serverService)
-		server.RegisterName("ClientService", clientService)
-		server.HandleHTTP(networkBus.path, "/debug"+networkBus.path)
-		l, e := net.Listen("tcp", networkBus.address)
-		if e != nil {
-			err = fmt.Errorf("listen error: %v", e)
-		}
-		service.wg.Add(1)
-		go http.Serve(l, nil)
-	} else {
-		err = errors.New("Server bus already started")
+	if service.rpc.started() {
+		return errors.New("Server bus already started")
 	}
-	return err
+	address, err := service.rpc.start(networkBus.address, networkBus.path, map[string]any{
+		"ServerService": networkBus.Server.service,
+		"ClientService": networkBus.Client.service,
+	})
+	if err != nil {
+		return fmt.Errorf("listen error: %w", err)
+	}
+	networkBus.address = address
+	networkBus.Server.address = address
+	networkBus.Client.address = address
+	return nil
 }
 
-// Stop - signal for the service to stop serving
+// Stop - stops serving and closes the listener
 func (networkBus *NetworkBus) Stop() {
-	service := networkBus.service
-	if service.started {
-		service.wg.Done()
-		service.started = false
-	}
+	networkBus.service.rpc.stop()
 }

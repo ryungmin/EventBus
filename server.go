@@ -3,9 +3,9 @@ package EventBus
 import (
 	"errors"
 	"fmt"
-	"net"
-	"net/http"
+	"log"
 	"net/rpc"
+	"slices"
 	"sync"
 )
 
@@ -38,8 +38,10 @@ type Server struct {
 	eventBus    Bus
 	address     string
 	path        string
+	lock        sync.Mutex // a lock for subscribers
 	subscribers map[string][]*SubscribeArg
 	service     *ServerService
+	rpc         rpcHTTP
 }
 
 // NewServer - create a new Server at the address and path
@@ -49,7 +51,7 @@ func NewServer(address, path string, eventBus Bus) *Server {
 	server.address = address
 	server.path = path
 	server.subscribers = make(map[string][]*SubscribeArg)
-	server.service = &ServerService{server, &sync.WaitGroup{}, false}
+	server.service = &ServerService{server}
 	return server
 }
 
@@ -58,95 +60,97 @@ func (server *Server) EventBus() Bus {
 	return server.eventBus
 }
 
-func (server *Server) rpcCallback(subscribeArg *SubscribeArg) func(args ...interface{}) {
-	return func(args ...interface{}) {
-		client, connErr := rpc.DialHTTPPath("tcp", subscribeArg.ClientAddr, subscribeArg.ClientPath)
-		defer client.Close()
-		if connErr != nil {
-			fmt.Errorf("dialing: %v", connErr)
+// rpcCallback returns the local handler that forwards events to a remote client.
+// Delivery errors are logged, because a handler has no way to return them.
+func (server *Server) rpcCallback(subscribeArg *SubscribeArg) func(args ...any) {
+	return func(args ...any) {
+		if subscribeArg.SubscribeType == SubscribeOnce {
+			// the local handler is gone, so let the client subscribe again
+			server.removeSubscriber(subscribeArg)
 		}
-		clientArg := new(ClientArg)
-		clientArg.Topic = subscribeArg.Topic
-		clientArg.Args = args
-		var reply bool
-		err := client.Call(subscribeArg.ServiceMethod, clientArg, &reply)
-		if err != nil {
-			fmt.Errorf("dialing: %v", err)
+		if err := pushEvent(subscribeArg, args); err != nil {
+			log.Printf("EventBus: push %q to %s%s: %v", subscribeArg.Topic, subscribeArg.ClientAddr, subscribeArg.ClientPath, err)
 		}
 	}
+}
+
+func pushEvent(subscribeArg *SubscribeArg, args []any) error {
+	client, err := rpc.DialHTTPPath("tcp", subscribeArg.ClientAddr, subscribeArg.ClientPath)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	clientArg := &ClientArg{Args: args, Topic: subscribeArg.Topic}
+	var reply bool
+	return client.Call(subscribeArg.ServiceMethod, clientArg, &reply)
 }
 
 // HasClientSubscribed - True if a client subscribed to this server with the same topic
 func (server *Server) HasClientSubscribed(arg *SubscribeArg) bool {
-	if topicSubscribers, ok := server.subscribers[arg.Topic]; ok {
-		for _, topicSubscriber := range topicSubscribers {
-			if *topicSubscriber == *arg {
-				return true
-			}
-		}
-	}
-	return false
+	server.lock.Lock()
+	defer server.lock.Unlock()
+	return server.hasClientSubscribed(arg)
+}
+
+func (server *Server) hasClientSubscribed(arg *SubscribeArg) bool {
+	return slices.ContainsFunc(server.subscribers[arg.Topic], func(subscriber *SubscribeArg) bool {
+		return *subscriber == *arg
+	})
+}
+
+func (server *Server) removeSubscriber(arg *SubscribeArg) {
+	server.lock.Lock()
+	defer server.lock.Unlock()
+	server.subscribers[arg.Topic] = slices.DeleteFunc(server.subscribers[arg.Topic], func(subscriber *SubscribeArg) bool {
+		return subscriber == arg
+	})
 }
 
 // Start - starts a service for remote clients to subscribe to events
 func (server *Server) Start() error {
-	var err error
-	service := server.service
-	if !service.started {
-		rpcServer := rpc.NewServer()
-		rpcServer.Register(service)
-		rpcServer.HandleHTTP(server.path, "/debug"+server.path)
-		l, e := net.Listen("tcp", server.address)
-		if e != nil {
-			err = e
-			fmt.Errorf("listen error: %v", e)
-		}
-		service.started = true
-		service.wg.Add(1)
-		go http.Serve(l, nil)
-	} else {
-		err = errors.New("Server bus already started")
+	if server.rpc.started() {
+		return errors.New("Server bus already started")
 	}
-	return err
+	address, err := server.rpc.start(server.address, server.path, map[string]any{"ServerService": server.service})
+	if err != nil {
+		return fmt.Errorf("listen error: %w", err)
+	}
+	server.address = address
+	return nil
 }
 
-// Stop - signal for the service to stop serving
+// Stop - stops serving and closes the listener
 func (server *Server) Stop() {
-	service := server.service
-	if service.started {
-		service.wg.Done()
-		service.started = false
-	}
+	server.rpc.stop()
 }
 
 // ServerService - service object to listen to remote subscriptions
 type ServerService struct {
-	server  *Server
-	wg      *sync.WaitGroup
-	started bool
+	server *Server
 }
 
 // Register - Registers a remote handler to this event bus
 // for a remote subscribe - a given client address only needs to subscribe once
 // event will be republished in local event bus
 func (service *ServerService) Register(arg *SubscribeArg, success *bool) error {
-	subscribers := service.server.subscribers
-	if !service.server.HasClientSubscribed(arg) {
-		rpcCallback := service.server.rpcCallback(arg)
+	server := service.server
+	server.lock.Lock()
+	defer server.lock.Unlock()
+	if !server.hasClientSubscribed(arg) {
+		rpcCallback := server.rpcCallback(arg)
+		var err error
 		switch arg.SubscribeType {
 		case Subscribe:
-			service.server.eventBus.Subscribe(arg.Topic, rpcCallback)
+			err = server.eventBus.Subscribe(arg.Topic, rpcCallback)
 		case SubscribeOnce:
-			service.server.eventBus.SubscribeOnce(arg.Topic, rpcCallback)
+			err = server.eventBus.SubscribeOnce(arg.Topic, rpcCallback)
+		default:
+			err = fmt.Errorf("unknown subscribe type %d", arg.SubscribeType)
 		}
-		var topicSubscribers []*SubscribeArg
-		if _, ok := subscribers[arg.Topic]; ok {
-			topicSubscribers = []*SubscribeArg{arg}
-		} else {
-			topicSubscribers = subscribers[arg.Topic]
-			topicSubscribers = append(topicSubscribers, arg)
+		if err != nil {
+			return err
 		}
-		subscribers[arg.Topic] = topicSubscribers
+		server.subscribers[arg.Topic] = append(server.subscribers[arg.Topic], arg)
 	}
 	*success = true
 	return nil
